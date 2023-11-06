@@ -1,0 +1,718 @@
+---
+title: "Bsh and CaTaDa in L4/L5 neurons"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: false
+    toc_depth: 3
+    number_sections: false
+---
+
+# Introduction
+
+The following analyses were used in Xu et al, *eLife*, 2023 (in press). They makes use of CATaDa (i.e. Dam-only binding data) and Bsh TaDa binding data, combined with existing scRNA-seq data, to discover gene expression and motif enrichment associated with Bsh in L4 neurons.
+
+# Initial NGS data processing
+
+NGS data were processed using [damidseq_pipeline](https://owenjm.github.io/damidseq_pipeline/) v1.5.3, and Dam-only tracks saved with the `--coverage` option.
+
+Peaks were processed using [find_peaks](https://github.com/owenjm/find_peaks) v1.0.3. For CaTaDa, parameters were `--min_quant=70`. For Bsh, default parameters were used. All replicates were processed separately.
+
+# Load libraries and define functions
+
+```{r libraries_and_functions}
+# We're using pacman to make life easier ...
+if (!require("pacman")) install.packages("pacman"); library(pacman,quietly = T)
+
+# Now we load the rest:
+p_load(
+  "tools",
+  "parallel",
+  "ggplot2",
+  "stringr",
+  "dplyr",
+  "tidyr",
+  "NOISeq",
+  "GenomicRanges",
+  "BSgenome",
+  "preprocessCore",
+  "BSgenome.Dmelanogaster.UCSC.dm6",
+  "BioVenn"
+)
+
+theme_set(theme_bw())
+
+curr.date = Sys.Date()
+cutoff=0.85
+
+read.gff = function (x,name="score") {
+  fn.ext = file_ext(x)
+  
+  if (grepl("gff$",ignore.case=T,fn.ext)) {
+	temp.data <- read.table(x,row.names=NULL)
+  	if (ncol(temp.data) > 5) {
+  	  # GFF
+  	  trim.data = temp.data[,c(1,4,5,6)]
+  	} else {
+  		cat("Error: file does not appear to be in GFF format\n\n")
+  		quit("no",1)
+  	}
+  } else if (grepl("bedgraph$",ignore.case=T,fn.ext)) {
+  	temp.data = read.table(x,row.names=NULL,skip=1)
+  	if (ncol(temp.data) == 4) {
+  		# bedgraph
+  		trim.data = temp.data
+  	} else {
+  		cat("Error: file does not appear to be in bedGraph format\n\n")
+  		quit("no",1)
+  	}
+  } else {
+  	cat("Error: input file does not appear to be in bedGraph or GFF format ...\n\n")
+  	quit("no",1)
+  }
+  
+  names(trim.data) = c("chr","start","end",name)
+  trim.data$chr = gsub("^chr","",trim.data$chr,perl=T)
+  
+  return(trim.data)
+}
+
+build.dataframes = function (bedgraphs) {
+  cat("Building dataframes:\n")
+  
+  data.all = NULL
+  for (i in 1:length(bedgraphs)) {
+    file = bedgraphs[i]
+    prot = regmatches(file,regexpr("(?<=/)(?!.*/).*?(?=\\.(gatc|average))",file,perl=T))
+    cat("  loading",prot,"...\n")
+    tempin = read.gff(file,tolower(prot))
+    data.all = if (is.null(data.all)) tempin else merge(data.all,tempin,by=c("chr","start","end"))
+  }
+  
+  # order by chr and fragment
+  data.all = data.all[order(data.all$chr,data.all$start),]
+  return(data.all)
+}
+
+find.overlap.sites = function (query, subject, maxgap=0) {
+  subject[ 
+    as.data.frame(findOverlaps(query, subject, maxgap = maxgap)) %>%
+      dplyr::select(subjectHits) %>% 
+      unlist(use.names = F)
+    ]
+}
+
+all.overlaps.to.original = function (query, subject, maxgap=0) {
+  ol = findOverlaps(query, subject, maxgap = maxgap)
+  testl=list(); 
+  null = lapply(
+    queryHits(ol),
+    FUN = function(x)testl[[x]]<<-""
+    )
+  null = apply(
+    ol%>%as.data.frame,1,function(x){
+      qh = as.numeric(unname(x[1])); sh = as.numeric(unname(x[2])); shg = genes$name[sh]; testl[[qh]] <<- if (testl[[qh]][1]=="") shg else c(testl[[qh]],shg) 
+    }
+  )
+  outl = lapply(
+    testl,
+    function (x) {y = paste(sort(x),collapse=",")}
+  )
+  
+  query$matches = outl %>% unlist
+  #return(query)
+  return(outl %>% unlist)
+}
+
+region.to.coords = function (x) {
+  (regmatches(x,regexec("(.*?):(\\d+)-(\\d+)",x,perl=T)) %>% unlist())[2:4]
+}
+
+regions.to.gr = function (x) {
+  GRanges(regions.to.df(x))
+}
+
+gr.occupancy = function (input.df, gr, buffer=0) {
+  total = length(gr)
+  gdf = as.data.frame(gr)
+  names(gdf)[1]='chr'
+  gdf$name = apply(gdf,1,function (x) sprintf("%s:%s-%s",x[1],as.numeric(x[2]),as.numeric(x[3])))
+  
+  genes = gdf[,c('chr','start','end','strand','name')]
+  
+  avg.exp = data.frame(input.df[1,c(4:(length(names(input.df))))])
+  avg = vector(length=(length(names(input.df)) - 4))
+  avg.exp = avg.exp[0,]
+  
+  ### Gene expression values ###  
+  cat("Calculating gene values ...")
+  
+  count = 0
+  
+  # unroll chromosomes for speed:
+  mc.out = mclapply(unique(genes$chr), mc.cores = global.mc.cores, function (chromo) {
+    input.chr = subset(input.df, chr==chromo)
+    genes.chr = subset(genes, chr==chromo)
+    for (i in 1:length(genes.chr$name)) {
+      # Roll through each gene
+      
+      gene.start = genes.chr[i,"start"] - buffer
+      gene.end = genes.chr[i,"end"] + buffer
+      
+      gene.start = ifelse(gene.start < 1, 1, gene.start)
+      
+      # Create data frames for all gatc fragments covering current gene
+      exp = data.frame(input.chr[ (input.chr$start <= gene.end) 
+                                  & (input.chr$end >= gene.start) 
+                                  ,] )
+      
+      gatc.num = length(exp[,1])
+      
+      # skip if no gatc fragments cover gene :(
+      if (gatc.num == 0) {next}
+      
+      # trim to gene boundaries ...
+      exp$start[1] = gene.start
+      exp$end[length(exp[,1])] = gene.end
+      
+      # gene length covered by gatc fragments
+      len = sum(exp$end-exp$start)
+      
+      # calculate weighted score for each column (representing different proteins)
+      for (j in 4:length(names(input.chr))) {
+        avg[j] = (sum((exp$end-exp$start)*exp[j]))/len
+      }
+      
+      # make data.frame of averages (to be appended to avg.exp)
+      df = cbind(avg[1])
+      for (k in 2:length(avg)) {
+        df = cbind(df,avg[k])
+      }
+      df = cbind(df,gatc.num)
+      
+      
+      # append current gene to list
+      avg.exp = rbind(avg.exp,data.frame(name=as.character(genes.chr[i,"name"]), df))
+      count = count+1
+      if (count %% 200 == 0) {cat(".")}
+    }
+    return(avg.exp)
+  })
+  
+  cat("\n")
+  
+  for (i in 1:length(mc.out)) {
+    avg.exp = rbind(avg.exp, mc.out[[i]])
+  }
+  
+  avg.exp = avg.exp[,c(1,5:(length(names(avg.exp))))]
+  names(avg.exp) = c("name",names(input.df)[c(4:(length(names(input.df))))],"gatc.num")
+  #avg.exp = avg.exp[order(-avg.exp$rpii18),]
+  
+  return(avg.exp)
+}
+
+### Read in flybase genename lookup table:
+load("data/fb.syn.d_2023_01.Rdata")
+
+fb2gn2 = function (f) {
+  out = vector()
+  for (n in f) {
+    x = unlist(gn.syn.d[n],use.names = F)
+    o = if (is.null(x)) "unknown" else x
+    out = c(out,o)
+  }
+  return(out)
+}
+
+# Gene definitions and GRanges object
+p_load("TxDb.Dmelanogaster.UCSC.dm6.ensGene")
+txdb = TxDb.Dmelanogaster.UCSC.dm6.ensGene
+genes = genes(txdb)
+
+seqlevels(genes)= levels(gsub("^chr","",seqnames(genes))) # hate levels so bad!
+seqnames(genes) = gsub("^chr","",seqnames(genes))
+genes$name = fb2gn2(genes$gene_id)
+
+
+read.genes.gff = function (file) {
+  # reads GFF, returns GRanges object
+  if (grepl(".gz$",file)) {
+    fc = gzfile(file,'rt')
+  } else {
+    fc = file
+  }
+  genes = read.table(fc, quote="\"",sep="\t",col.names = c("chr","source","feature","start","end","score","strand","phase","attr"))
+  genes$name = genes$attr %>% str_extract("(?<=Name=).*?(?=;)")
+  #genes = genes %>% filter(feature=="gene")
+  gr = GRanges(genes)
+  return(gr)
+}
+
+regions.to.df = function (x) {
+  y = vapply(x, function (x) region.to.coords(x), FUN.VALUE = c(chr = "2L", start = 0, end = 0)) %>% t %>% as.data.frame()
+  y$start = as.numeric(y$start)
+  y$end = as.numeric(y$end)
+  y$chr = sapply(y$chr,FUN = function (x) sprintf("chr%s",x),USE.NAMES = F)
+  return(y)
+}
+
+reduce.regions = function (peaks) {
+  pl = NULL
+  for (f in peaks) {
+    pt = read.genes.gff(f)
+    pl = if (is.null(pl)) pt else c(pl,pt)
+  }
+  pr = reduce(pl)
+  pr$id = apply(as.data.frame(pr),1,function (x) sprintf("%s:%s-%s",x[1],as.numeric(x[2]),as.numeric(x[3])))
+  return(pr)
+}
+
+noiseq.fisher = function (out.volcano, matches, test.genes) {
+  mynoiseq.all = out.volcano$noiseq
+  red_points = rownames(mynoiseq.all)[rownames(mynoiseq.all) %in% rownames(mynoiseq.all)[grep(sprintf("(^|,)(%s)(,|$)",test),matches,perl = T,ignore.case = T)]]
+  lrp = length(red_points)
+  
+  upreg = out.volcano$upreg
+  downreg = out.volcano$downreg
+  
+  ldr = sum(red_points %in% downreg)
+  lur = sum(red_points %in% upreg)
+  
+  fishertab = data.frame(row.names = c("L4exp","L4notexp"), up=c(lur,length(upreg)-lur), down=c(ldr,length(downreg)-ldr))
+  
+  print(fishertab)
+  
+  fisher.test(fishertab)
+}
+
+sci.num.l = function (x,y=NULL) {
+  x = as.numeric(x)
+  v = if (x<0.01) sprintf("%0.1e",x) else sprintf("%0.2f",x)
+  ret = sprintf("italic(p)==%s",v)
+  if (!(is.null(y))) {
+    y = sprintf("%0.2f",as.numeric(y))
+    ret = sprintf("%s~';'~odds==%s",ret,y)
+  }
+  cat(ret)
+  return(ret)
+}
+
+addchr = function (x) {
+  seqlevels(x) = gsub("^(.*)$", "chr\\1", seqlevels(x))
+  return(x)
+}
+
+
+remchr = function (x) {
+  seqlevels(x) = gsub("^chr", "", seqlevels(x))
+  return(x)
+}
+
+plot_volcano = function (mydata,
+                         cond=c("kdm5_140","wt"),
+                         output.pdf = F,
+                         highlight.genes=NULL,
+                         highlight.genes2=NULL,
+                         highlight.loci=NULL,
+                         highlight.special.loci.up=NULL,
+                         highlight.special.loci.down=NULL,
+                         label.genes=NULL,
+                         mynoiseq =  noiseq(mydata,conditions=cond,factor="Tissue",norm="uqua",replicates = "biological"),
+                         plot.title = "Differentially expressed genes",
+                         x.lab = paste("log(fold change (",cond[1],"/",cond[2],")",sep=""),
+                         y.lab =bquote("-log(P)"),
+                         theme.size = 18,
+                         text.repel.size = 6,
+                         label.points=T,
+                         label.all=F,
+                         custom.labels=NULL,
+                         plot.subtitle=NULL,
+                         max.overlaps=25,
+                         plotname="",
+                         plotdesc=plot.title,
+                         sig.col = "orange",
+                         highlight.col = "red",
+                         highlight.col2="springgreen",
+                         highlight.loci.col = "cyan",
+                         highlight.special.loci.up.col="red",
+                         highlight.special.loci.down.col="springgreen",
+                         psize=1,
+                         spsize=1,
+                         lpsize=1,
+                         hpsize=1,
+                         palpha=0.1,
+                         spalpha=0.2,
+                         hpalpha=0.5,
+                         lpalpha=1,
+                         xlim=NULL,
+                         ylim=NULL,
+                         input=NULL,
+                         goterms=F,
+                         pdfw=2.7,
+                         pdfh=3,
+                         ft.alt="two.sided",
+                         test.genes=NULL,
+                         test.loci=NULL,
+                         test.special.loci=NULL
+                         ) {
+  # grab the full dataset
+  
+  mynoiseq.all = mynoiseq@results[[1]]
+  mynoiseq.all$log.rat = log(mynoiseq.all[[paste(gsub(pattern = "-",replacement = ".",x = cond[1]),"mean",sep="_")]]/mynoiseq.all[[paste(gsub(pattern = "-",replacement = ".",x = cond[2]),"mean",sep="_")]],base = 2)
+  mynoiseq.all$log.prob = -log(1-mynoiseq.all$prob)
+  
+  # get differentially expressed genes
+  mydeg = degenes(mynoiseq,q=cutoff,M=NULL)
+  mydeg.up = degenes(mynoiseq,q=cutoff,M="up")
+  mydeg.down = degenes(mynoiseq,q=cutoff,M="down")
+  mydeg099 = degenes(mynoiseq,q=cutoff,M=NULL)
+  
+  # calculate means
+  input[[cond[2]]] = log(rowMeans(input[,grep(cond[2],names(input))]))
+  input[[cond[1]]] = log(rowMeans(input[,grep(cond[1],names(input))]))
+  
+  # volcano plot
+  p = ggplot(mynoiseq.all,aes(log.rat,log.prob))+
+    theme_bw(base_size=theme.size)+
+    geom_point(color=rgb(0.4,0.4,0.4),alpha=palpha,size=psize,shape=16)+
+    geom_point(data=subset(mynoiseq.all,rownames(mynoiseq.all) %in% rownames(mydeg))[,c("log.rat","log.prob")],
+               color=sig.col,alpha=spalpha,size=psize,shape=16)+
+    #geom_point(data=subset(mynoiseq.all,rownames(mynoiseq.all) %in% rownames(mydeg.up))[,c("log.rat","log.prob")],
+               #color="orange",alpha=0.1,size=2)+
+    
+    #xlim(-2,3)+
+    #ylim(0,7)+
+    xlab(x.lab)+
+    ylab(y.lab)+
+    ggtitle(plot.title,plot.subtitle)
+  
+  if (!(is.null(xlim))) {
+    p = p+
+      xlim(xlim[1],xlim[2])
+  }
+  
+  if (!(is.null(ylim))) {
+    p = p+
+      ylim(ylim[1],ylim[2])
+  }
+  
+  # highlight loci
+  if (!(is.null(highlight.loci))) {
+    p=p+geom_point(data=subset(mynoiseq.all,rownames(mynoiseq.all) %in% highlight.loci)[,c("log.rat","log.prob")],color=highlight.loci.col,alpha=hpalpha,size=lpsize,shape=16)
+  }
+  
+   # highlight genes
+  if (!(is.null(highlight.genes))) {
+    
+    # special override:
+    if (!(is.null(highlight.special.loci.up))) {
+      p=p+geom_point(data=subset(mynoiseq.all,rownames(mynoiseq.all) %in% highlight.special.loci.up)[,c("log.rat","log.prob")],color=highlight.special.loci.up.col,alpha=lpalpha,size=hpsize,shape=16)
+      if (!is.null(highlight.special.loci.down)) p=p+geom_point(data=subset(mynoiseq.all,rownames(mynoiseq.all) %in% highlight.special.loci.down)[,c("log.rat","log.prob")],color=highlight.special.loci.down.col,alpha=lpalpha,size=hpsize,shape=16)
+      points.to.highlight=c(highlight.special.loci.up,highlight.special.loci.down)
+    } else {
+      points.to.highlight = rownames(mynoiseq.all)[rownames(mynoiseq.all) %in% rownames(mynoiseq.all)[grep(sprintf("(^|,)(%s)(,|$)",highlight.genes),custom.labels,perl = T,ignore.case = T)]]
+        
+    
+    p=p+geom_point(data=subset(mynoiseq.all,rownames(mynoiseq.all) %in% points.to.highlight)[,c("log.rat","log.prob")],color=highlight.col,alpha=hpalpha,size=hpsize,shape=16)
+    }
+  }
+
+  # second highlight group?
+  if (!(is.null(highlight.genes2))) {
+      points.to.highlight2 = rownames(mynoiseq.all)[rownames(mynoiseq.all) %in% rownames(mynoiseq.all)[grep(sprintf("(^|,)(%s)(,|$)",highlight.genes2),custom.labels,perl = T,ignore.case = T)]]
+        
+    
+    p=p+geom_point(data=subset(mynoiseq.all,rownames(mynoiseq.all) %in% points.to.highlight2)[,c("log.rat","log.prob")],color=highlight.col2,alpha=hpalpha,size=spsize,shape=16)
+  }
+  
+  if (label.points & !(is.null(custom.labels))) {
+    points.to.label = if (!is.null(label.genes)) {
+        if (label.all) {
+          rownames(mynoiseq.all)[rownames(mynoiseq.all) %in% rownames(mynoiseq.all)[grep(sprintf("(^|,)(%s)(,|$)",label.genes),custom.labels,perl = T,ignore.case = T)]]
+        } else {
+          rownames(mydeg099)[rownames(mydeg099) %in% rownames(mynoiseq.all)[grep(sprintf("(^|,)(%s)(,|$)",label.genes),custom.labels,perl = T,ignore.case = T)]]
+        }
+      } else rownames(mydeg099)
+    p = p + geom_text_repel(data=subset(mynoiseq.all,rownames(mynoiseq.all) %in% points.to.label)[,c("log.rat","log.prob")],
+                   aes(label=custom.labels[rownames(mynoiseq.all) %in% points.to.label]),size=text.repel.size,
+                   box.padding=0.3,
+                   point.padding = 0.3,
+                   label.padding=0.3,
+                   min.segment.length = 0.1,
+                   max.overlaps = max.overlaps
+    )
+    
+    if (!is.null(label.genes)) {
+      p = p + geom_point(data=subset(mynoiseq.all,rownames(mynoiseq.all) %in% points.to.label)[,c("log.rat","log.prob")],
+                   color=highlight.col,alpha=hpalpha,size=1,,shape=16)
+    }
+  }
+  
+  upreg = rownames(degenes(mynoiseq,q=cutoff,M="up"))
+  downreg = rownames(degenes(mynoiseq,q=cutoff,M="down"))
+  
+  ft = NULL
+  fishertab = NULL
+  red_points = NULL
+  
+  if (!(is.null(ft.alt))) {
+    if (!is.null(test.special.loci)) {
+      red_points=highlight.special.loci.up
+    } else if (is.null(test.genes)) {
+      red_points=highlight.loci
+    } else {
+      # red_points = rownames(mynoiseq.all)[rownames(mynoiseq.all) %in% rownames(mynoiseq.all)[grep(sprintf("(^|,)(%s)(,|$)",test.genes),input$matches,perl = T,ignore.case = T)]]
+      
+      red_points=points.to.highlight
+      label.genes = input[input$name %in% red_points,"matches"]
+    }
+    
+    if (!is.null(test.loci) & !is.null(test.genes)) {
+      tup = highlight.loci[highlight.loci %in% upreg]
+      tdown =  highlight.loci[highlight.loci %in% downreg]
+    } else {
+      tup = upreg
+      tdown = downreg
+    }
+      
+    lrp = length(red_points)
+    
+    if (!is.null(highlight.loci)) {
+      overlap_points = red_points[red_points %in% highlight.loci]
+      ldr = sum(overlap_points %in% tdown)
+      lur = sum(overlap_points %in% tup)
+      fishertab = data.frame(row.names = c("Bound","Unbound"), up=c(lur,length(tup)-lur), down=c(ldr,length(tdown)-ldr))
+      
+    } else {
+  
+      ldr = sum(red_points %in% tdown)
+      lur = sum(red_points %in% tup)
+      fishertab = data.frame(row.names = c("Bound","Unbound"), up=c(lur,length(tup)-lur), down=c(ldr,length(tdown)-ldr))
+    }
+      
+    print(fishertab)
+    
+    ft = fisher.test(fishertab,alternative=ft.alt)
+    p = p+annotate(geom = "text",label=sci.num.l(ft$p.value,ft$estimate),x=max(mynoiseq.all$log.rat)-3,y=max(mynoiseq.all$log.prob[!(is.infinite(mynoiseq.all$log.prob))])-4,parse=T)
+  }
+  
+  if (output.pdf) pdf(sprintf("%s %s %s vs %s %s.pdf",plotname,plotdesc,cond[1],cond[2],curr.date),width=pdfw,height=pdfh)
+  print(p)
+  if (output.pdf) dev.off()
+  
+  if (output.pdf) {
+    svg(sprintf("%s %s %s vs %s %s.svg",plotname,plotdesc,cond[1],cond[2],curr.date),width=pdfw,height=pdfh)
+    print(p)
+    dev.off()
+  }
+  
+  return(list(upreg=upreg,downreg=downreg,noiseq=mynoiseq.all,plot=p,ft=ft,fishertab=fishertab,red_points=red_points))
+}
+
+region.venn = function (all,noiseq.out,filename) {
+  shared= all$id[!(all$id %in% c(noiseq.out$upreg,noiseq.out$downreg))]
+  catada_venn = draw.venn(c(noiseq.out$upreg,shared),c(noiseq.out$downreg,shared), list_z = NULL,xtitle = "L4",ytitle = "L5",title = "",subtitle = "",output = "pdf",filename = filename)
+}
+
+str.to.pwm = function (x,x1000=F) {
+  z = str_split_1(x,"\n")
+  pwm = vapply(z,function(x) {
+    y = (regmatches(x,regexec("\\d\\s+([\\d\\.]+)\\s+([\\d\\.]+)\\s+([\\d\\.]+)\\s+([\\d\\.]+)",text = x,perl = T)) %>% unlist())[2:5] %>% as.numeric()
+    if (x1000) y = y * 1000
+    print(y)
+    print(sum(y))
+    y=y
+  }, FUN.VALUE = c(A=0,C=0,G=0,T=0)) %>% t
+  
+  mode(pwm)="integer"
+  return(PWM(as.matrix(t(pwm)),type="prob"))
+}
+
+pwm.find = function (pwm, regions, refgenome=Dmelanogaster, score.cut="95%", max.mismatch=0, fixed.width=1000, tada.motif.fix=NULL, max.fix.width=T) {
+  regions.gr = regions.to.gr(regions)
+  if (!(is.null(fixed.width))) {
+    if (max.fix.width) {
+      for (i in 1:length(regions.gr)) {if (width(regions.gr[i,])>fixed.width) regions.gr[i,] = resize(regions.gr[i,],width=fixed.width,fix="center")}
+    } else {
+      regions.gr = resize(regions.gr,width=fixed.width,fix="center")
+    }
+  }
+  seqs = getSeq(refgenome,regions.gr)
+  seqs.pwm = sapply(seqs, function (x) {matchPWM(pwm,x,min.score = score.cut)}) %>% summary() %>% as.data.frame() %>% dplyr::rename(Freq.f = Freq) %>% filter(Var2=="Length")
+  seqs.pwm$width = width(seqs)
+  
+  seqs.pwm.r = sapply(seqs, function (x) {matchPWM(reverseComplement(pwm),x,min.score = score.cut)}) %>% summary() %>% as.data.frame() %>% dplyr::rename(Freq.r = Freq) %>% filter(Var2=="Length")
+  seqs.pwm.r$width = width(seqs)
+  seqs.pwm.all = merge(seqs.pwm,seqs.pwm.r, by=c("Var1","Var2","width"))
+  
+  seqs.pwm.all$Freq.f = as.numeric(seqs.pwm.all$Freq.f)
+  seqs.pwm.all$Freq.r = as.numeric(seqs.pwm.all$Freq.r)
+  
+  seqs.pwm.all$Freq = apply(as.matrix(seqs.pwm.all[,c("Freq.f","Freq.r")]),1,function(x) max(x))
+  return(seqs.pwm.all)
+}
+```
+
+# Load up the data
+
+```{r}
+files = c(Sys.glob("data/*ph"),Sys.glob("data/catada/*ph"))
+data = build.dataframes(files)
+
+# quantile normalised dataset
+bsh_qnorm = as.data.frame(normalize.quantiles(as.matrix(data[,grep("bsh_dam_l(4|5)_r",names(data),perl = T)])))
+names(bsh_qnorm) = paste(names(data)[grep("bsh_dam_l(4|5)_r",names(data),perl = T)],"_qnorm",sep="")
+
+# replicate means
+bsh_qnorm$bsh_l4_qnorm_avg = apply(bsh_qnorm[,grep("bsh_dam_l4",names(bsh_qnorm),perl = T)],1,function (x) {mean(x)})
+bsh_qnorm$bsh_l5_qnorm_avg = apply(bsh_qnorm[,grep("bsh_dam_l5",names(bsh_qnorm),perl = T)],1,function (x) {mean(x)})
+
+data$bsh_l4_avg = apply(data[,grep("bsh_dam_l4",names(data),perl = T)],1,function (x) {mean(x)})
+data$bsh_l5_avg = apply(data[,grep("bsh_dam_l5",names(data),perl = T)],1,function (x) {mean(x)})
+
+data$catada_l4_avg = apply(data[,grep("dam_only_l4",names(data),perl = T)],1,function (x) {mean(x)})
+data$catada_l5_avg = apply(data[,grep("dam_only_l5",names(data),perl = T)],1,function (x) {mean(x)})
+
+# merged dataset
+datam = cbind(data,bsh_qnorm)
+```
+
+```{r}
+# Load in scRNA-seq data
+l4_spec_mar = read.csv("data/l4_specific_March.csv",header=T,row.names = 1)
+names(l4_spec_mar)[1]="name"
+l5_spec_mar = read.csv("data/l5_specific_March.csv",header=T,row.names = 1)
+names(l5_spec_mar)[1]="name"
+
+l4_rnaseq_spec_mar = capture.output(cat(l4_spec_mar$name,sep = "|"))
+l5_rnaseq_spec_mar = capture.output(cat(l5_spec_mar$name,sep = "|"))
+```
+
+# CaTaDa
+
+Here, we read in the CaTaDa peaks for each replicate/sample. Peaks are reduced to a single merged dataset that considers a peak region found in any replicate. CaTaDa coverage over each peak region is calculated for each replicate.
+
+```{r}
+peaks.catada = Sys.glob("data/catada/peak_analysis.Dam*/*gff")
+pr.catada = reduce.regions(peaks.catada)
+
+catada_data = data[,c(1:3,10:15)]
+
+global.mc.cores=7
+catada_peaks = gr.occupancy(catada_data,pr.catada)
+catada_peaks$matches = all.overlaps.to.original(pr.catada,genes,maxgap = 1000)
+```
+
+## NOISeq to discover peaks with differential occupancy
+
+We use the nonparametric differential expression analysis package [NOISeq](https://doi.org/doi:10.18129/B9.bioc.NOISeq) to call differentially accessible or bound regions from the data. We find that NOISeq works well on all forms of TaDa data (including RNA Polymerase occupancy, CATaDa accessibility data and transcription factor binding).
+
+```{r}
+cutoff=0.85
+
+input=catada_peaks
+row.names(input) = catada_peaks$name
+mycounts=input[,c(2:(ncol(input)-2))]
+
+myfactors = data.frame(
+  Tissue = regmatches(names(input),regexpr(".*?(?=_r)",names(input),perl=T)),
+  TissueRun=regmatches(names(input),regexpr(".*?(?=-ext300)",names(input),perl=T))
+)
+mydata = readData(data=mycounts,factors=myfactors)
+```
+
+## Figure 6B and Figure 6 -- figure supplement 2B
+
+The plots below show the differential enrichment of expressed genes with differentially-accessible regions of chromatin, between the L4 and L5 lineages.
+
+```{r}
+# Volcano plots
+out.catada_final = plot_volcano(mydata,cond=c("dam_only_l4","dam_only_l5"),output.pdf = F,plot.title = "Chromatin accessibility changes",custom.labels = input$matches,theme.size = 15,text.repel.size = 2,max.overlaps = 20,highlight.genes = l4_rnaseq_spec_mar, input=input,x.lab = "log(L4/L5)", plotname = "Figure_6B", label.all=T, plot.subtitle = "L4 specific genes highlighted", highlight.col = "red", highlight.col2 = "#00E0E0", label.points = F,psize=0.3,hpsize = 0.3,pdfw=3,pdfh=3,xlim=c(-5,5),ylim=c(0,8),hpalpha = 1,ft.alt = "greater", test.genes = T)
+
+out.catada_final2 = plot_volcano(mydata,cond=c("dam_only_l4","dam_only_l5"),output.pdf = F,plot.title = "Chromatin accessibility changes",custom.labels = input$matches,theme.size = 15,text.repel.size = 2,max.overlaps = 20,highlight.genes = l5_rnaseq_spec_mar, input=input,x.lab = "log(L4/L5)", plotname = "Figure_6—figure supplement_2B", label.all=T, plot.subtitle = "L5 specific genes highlighted", highlight.col = "red", highlight.col2 = "#00E0E0", label.points = F,psize=0.3,hpsize=0.3,pdfw=3,pdfh=3,xlim=c(-5,5),ylim=c(0,8),hpalpha = 1,ft.alt = "less", test.genes = T)
+
+# Venn diagram
+region.venn(pr.catada,out.catada_final,"catada_venn.pdf")
+```
+
+# Bsh binding
+
+Now we take the Bsh peaks and perform the same analysis as with the CATaDa data above.
+
+```{r}
+peaks.bsh = Sys.glob("data/peak_analysis*/*gff")
+pr.bsh = reduce.regions(peaks.bsh)
+
+bsh_qnorm_data = datam[,c(1:3,20:25)]
+
+global.mc.cores=7
+bsh_peaks = gr.occupancy(bsh_qnorm_data,pr.bsh)
+bsh_peaks$matches = all.overlaps.to.original(pr.bsh,genes,maxgap = 1000)
+```
+
+## NOISeq to discover peaks with differential occupancy
+
+```{r}
+input.bsh=bsh_peaks
+input.bsh[,2:7]=2^input.bsh[,2:7]
+row.names(input.bsh) = bsh_peaks$name
+mycounts.bsh=input.bsh[,c(2:(ncol(input)-2))]
+
+myfactors.bsh = data.frame(
+  Tissue = regmatches(names(input.bsh),regexpr(".*?(?=_r)",names(input.bsh),perl=T)),
+  TissueRun=regmatches(names(input.bsh),regexpr(".*?(?=-ext300)",names(input.bsh),perl=T))
+)
+mydata.bsh = readData(data=mycounts.bsh,factors=myfactors.bsh)
+```
+
+## Figure 6C and Figure 6 -- figure supplement 2C
+
+These plots show the differential enrichment of expressed genes with differentially-bound Bsh peaks, between the L4 and L5 lineages.
+
+```{r}
+# Volcano plots
+# Figure 6C
+out.bsh_final= plot_volcano(mydata.bsh,cond=c("bsh_dam_l4","bsh_dam_l5"),output.pdf = F,plot.title = "Bsh peaks",custom.labels = input.bsh$matches,theme.size = 16,text.repel.size = 2,max.overlaps = 30,highlight.genes  = l4_rnaseq_spec_mar,input=input.bsh,x.lab = "log2 FC (L4/L5)",plotname = "Figure_6C", plot.subtitle = "L4 specific genes highlighted", label.points = F, highlight.col = "red",psize=0.3,hpsize=0.3,pdfw=3,pdfh=3,xlim=c(-3,3),ylim=c(0,8.5),ft.alt = "greater",test.genes = T)
+
+# Figure 6 -- figure supplement 2C
+out.bsh_final2= plot_volcano(mydata.bsh,cond=c("bsh_dam_l4","bsh_dam_l5"),output.pdf = F,plot.title = "Bsh peaks",custom.labels = input.bsh$matches,theme.size = 16,text.repel.size = 2,max.overlaps = 30,highlight.genes  = l5_rnaseq_spec_mar,input=input.bsh,x.lab = "log2 FC (L4/L5)",plotname = "Figure_6C-figure_supplement_2C", plot.subtitle = "L5 specific genes highlighted", label.points = F, highlight.col = "red",psize=0.3,hpsize=0.3,pdfw=3,pdfh=3,xlim=c(-3,3),ylim=c(0,8.5),ft.alt = "less",test.genes = T)
+
+# Venn diagram, Figure 6 -- figure supplement 2C
+region.venn(pr.bsh,out.bsh_final,sprintf("Figure_6-figure_supplement_2C_venn_%s.pdf",curr.date))
+```
+
+# Su(H) motif searches
+
+To search for enrichment of the Su(H) binding motif, we use the motif as defined in the cisbp database.
+
+```{r}
+motif.suh.cisbp = "7 0.0 0.0 0.5 0.5 G
+8 0.0 0.0 0.0 1.0 T
+9 0.0 0.0 0.0 1.0 T
+10 0.0 1.0 0.0 0.0 C
+11 0.0 0.7 0.0 0.3 C
+12 0.0 1.0 0.0 0.0 C
+13 1.0 0.0 0.0 0.0 A
+14 0.0 1.0 0.0 0.0 C
+15 0.6 0.0 0.4 0.0 A"
+motif.suh.pwm = str.to.pwm(motif.suh.cisbp,x1000 = T)
+```
+
+## Figure 6 -- figure supplement 2A
+
+These figures show the enrichment of the Su(H) motif in differentially-accessible regions of open chromatin between L4 and L5 neurons. In one figure, regions are linked to differentially expressed genes.
+
+```{r}
+# Find Su(H) motif
+catada.suh.pwm = pwm.find(pwm = motif.suh.pwm, regions = pr.catada$id, score.cut = "85%", fixed.width=1000)
+catada.suh.pwm.r = catada.suh.pwm %>% filter(Freq>0) %>% dplyr::select(Var1) %>% as.vector %>% unlist %>% unname
+suh.bound.catada = find.overlap.sites(catada.suh.pwm.r %>% as.character %>% regions.to.gr %>% remchr,pr.catada,maxgap = 0)
+
+# suh sites bounds and expressed
+out.catada_bshl4 = plot_volcano(mydata,cond=c("dam_only_l4","dam_only_l5"),output.pdf = F,plot.title = "Chromatin accessibility changes",custom.labels = input$matches,theme.size = 15,text.repel.size = 2,max.overlaps = 20,highlight.genes = l4_rnaseq_spec_mar, input=input,x.lab = as.expression(log[2]~"(L4/L5)"), plotname = "Su(H) overlap with accessible chromatin and expressed genes", label.all=T, plot.subtitle = "Su(H) motifs highlighted", highlight.loci =suh.bound.catada$id,highlight.col = "red", highlight.loci.col = "cornflowerblue", label.points = F,psize=0.2,spsize=0.2,pdfw=3,pdfh=3,xlim=c(-5,5),ylim=c(0,8),hpalpha = 0.4,lpalpha=0.8,ft.alt = "greater", test.genes = l4_rnaseq_spec_mar, test.loci =1,lpsize=0.2,hpsize=0.5 )
+
+out.catada_bshl4 = plot_volcano(mydata,cond=c("dam_only_l4","dam_only_l5"),output.pdf = F,plot.title = "Chromatin accessibility changes",custom.labels = input$matches,theme.size = 15,text.repel.size = 2,max.overlaps = 20,input=input,x.lab = as.expression(log[2]~"(L4/L5)"), plotname = "Figure_6-figure_supplement_2A", label.all=T, plot.subtitle = "Su(H) motifs highlighted", highlight.loci =suh.bound.catada$id,highlight.loci.col = "cornflowerblue", label.points = F,psize=0.2,spsize=0.2,pdfw=3,pdfh=3,xlim=c(-5,5),ylim=c(0,8),hpalpha = 0.4,lpalpha=0.8,ft.alt = "greater", test.genes = NULL, test.loci =1,lpsize=0.2,hpsize=0.5 )
+
+```
