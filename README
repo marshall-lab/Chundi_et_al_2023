@@ -1,14 +1,3 @@
----
-title: "Bsh and CaTaDa in L4/L5 neurons"
-output:
-  html_document:
-    toc: true
-    toc_float: true
-    toc_collapsed: false
-    toc_depth: 3
-    number_sections: false
----
-
 # Introduction
 
 The following analyses were used in Xu et al, *eLife*, 2023 (in press). They makes use of CATaDa (i.e. Dam-only binding data) and Bsh TaDa binding data, combined with existing scRNA-seq data, to discover gene expression and motif enrichment associated with Bsh in L4 neurons.
